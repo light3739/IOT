@@ -1,5 +1,2 @@
 influxdb-client
 paho-mqtt
-openai-whisper
-sounddevice
-numpy

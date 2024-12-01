@@ -14,6 +14,11 @@ services:
       - DOCKER_INFLUXDB_INIT_ORG=myorg
       - DOCKER_INFLUXDB_INIT_BUCKET=temperature_data
       - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=your-super-secret-auth-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   grafana:
     image: grafana/grafana:latest
@@ -22,10 +27,29 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:
-      - influxdb
+      influxdb:
+        condition: service_healthy
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=grafana123
+
+  subscriber:
+    build: .
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    volumes:
+      - ./emqxsl-ca.crt:/app/emqxsl-ca.crt:ro
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=your-super-secret-auth-token
+      - INFLUXDB_ORG=myorg
+      - INFLUXDB_BUCKET=temperature_data
+      - MQTT_BROKER=p4cfdde2.ala.eu-central-1.emqxsl.com
+      - MQTT_PORT=8883
+      - MQTT_USERNAME=esp8266_user
+      - MQTT_PASSWORD=esp8266_user
+    restart: unless-stopped
 
 volumes:
   influxdb-data:

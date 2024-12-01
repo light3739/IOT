@@ -1,23 +1,21 @@
+import json
+import logging
 import os
+import threading
+import time
 import wave
 from datetime import datetime
-
-import cv2
-import paho.mqtt.client as mqtt
-import pyaudio
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import SYNCHRONOUS
-import json
-import time
-
-import logging
-import whisper
-import sounddevice as sd
-import numpy as np
-import threading
 from queue import Queue
 
+import cv2
+import numpy as np
+import paho.mqtt.client as mqtt
+import pyaudio
+import sounddevice as sd
+import whisper
+
 from cam import ObjectDetector
+from subscriber import MQTT_TOPIC
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,42 +23,35 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Отключаем логи от opencv
+logging.getLogger('opencv').setLevel(logging.WARNING)
+
 # MQTT Configuration
-MQTT_BROKER = "p4cfdde2.ala.eu-central-1.emqxsl.com"
-MQTT_PORT = 8883
-MQTT_TOPIC = "test"
-MQTT_USERNAME = "esp8266_user"
-MQTT_PASSWORD = "esp8266_user"
-
-# InfluxDB Configuration
-INFLUXDB_URL = "http://localhost:8086"
-INFLUXDB_TOKEN = "your-super-secret-auth-token"  # Тот же токен, что в docker-compose
-INFLUXDB_ORG = "myorg"
-INFLUXDB_BUCKET = "temperature_data"
-
-# SSL Certificate path
-CERT_PATH = "emqxsl-ca.crt"
+MQTT_BROKER = os.getenv('MQTT_BROKER', "p4cfdde2.ala.eu-central-1.emqxsl.com")
+MQTT_PORT = int(os.getenv('MQTT_PORT', "8883"))
+MQTT_USERNAME = os.getenv('MQTT_USERNAME', "esp8266_user")
+MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', "esp8266_user")
+MQTT_CERT_PATH = os.getenv('MQTT_CERT_PATH', "emqxsl-ca.crt")
+# MQTT Topics
+OBJECT_DETECTION_TOPIC = "object_detection"
+SPEECH_TOPIC = "speech_text"
 
 
-class TemperatureAndSpeechMonitor:
+class AudioVideoProcessor:
     def __init__(self):
-        # Базовая инициализация
-        self.messages_received = 0
-        self.messages_written = 0
-
-        # Initialize InfluxDB client
-        self.influx_client = InfluxDBClient(
-            url=INFLUXDB_URL,
-            token=INFLUXDB_TOKEN,
-            org=INFLUXDB_ORG
-        )
-        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
 
         # Initialize MQTT client
-        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)  # Используем VERSION2
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        self.mqtt_client.tls_set(ca_certs=CERT_PATH)
+        self.mqtt_client.tls_set(ca_certs=MQTT_CERT_PATH)
 
+        try:
+            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            self.mqtt_client.loop_start()
+            logging.info(f"Connected to MQTT broker {MQTT_BROKER}")
+        except Exception as e:
+            logging.error(f"Failed to connect to MQTT broker: {e}")
+            raise
         # Set MQTT callbacks
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
@@ -204,21 +195,15 @@ class TemperatureAndSpeechMonitor:
             logging.error(f"Error checking ffmpeg: {str(e)}")
             return False
 
-    def connect(self):
-        try:
-            logging.info(f"Connecting to MQTT broker {MQTT_BROKER}...")
-            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            self.mqtt_client.loop_start()
-        except Exception as e:
-            logging.error(f"Failed to connect to MQTT broker: {e}")
-            raise
-
     def on_connect(self, client, userdata, flags, rc, properties=None):
-        """Callback для подключения к MQTT с поддержкой версии 2.0"""
         if rc == 0:
             logging.info("Connected to MQTT broker")
-            client.subscribe([(MQTT_TOPIC, 0), (self.speech_topic, 0)])
-            logging.info(f"Subscribed to topics: {MQTT_TOPIC}, {self.speech_topic}")
+            client.subscribe([
+                (MQTT_TOPIC, 0),
+                (self.speech_topic, 0),
+                (OBJECT_DETECTION_TOPIC, 0)
+            ])
+            logging.info(f"Subscribed to topics: {MQTT_TOPIC}, {self.speech_topic}, {OBJECT_DETECTION_TOPIC}")
         else:
             logging.error(f"Failed to connect to MQTT broker with code: {rc}")
 
@@ -232,46 +217,12 @@ class TemperatureAndSpeechMonitor:
             except Exception as e:
                 logging.error(f"Failed to reconnect: {e}")
 
-    def write_to_influxdb(self, point):
-        try:
-            self.write_api.write(bucket=INFLUXDB_BUCKET, record=point)
-            self.messages_written += 1
-            return True
-        except Exception as e:
-            logging.error(f"Failed to write to InfluxDB: {e}")
-            return False
-
     def on_message(self, client, userdata, msg):
         try:
-            # Parse the message
             payload = json.loads(msg.payload.decode())
-            self.messages_received += 1
             logging.info(f"Received message: {payload}")
-
-            # Обновленная логика для нового формата сообщений
-            temperature = payload.get("temperature")
-            if temperature is not None:
-                # Create InfluxDB point
-                point = Point("temperature") \
-                    .tag("device", payload.get("device", "unknown")) \
-                    .field("value", float(temperature)) \
-                    .time(datetime.utcnow())
-
-                # Write to InfluxDB
-                if self.write_to_influxdb(point):
-                    logging.info(f"Temperature {temperature}°C written to InfluxDB")
-            else:
-                logging.warning("No temperature value in message")
-
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse JSON: {e}")
         except Exception as e:
             logging.error(f"Error processing message: {e}")
-
-    def print_stats(self):
-        logging.info(f"\nStatistics:")
-        logging.info(f"Messages received: {self.messages_received}")
-        logging.info(f"Messages written to InfluxDB: {self.messages_written}")
 
     def cleanup(self):
         logging.info("Cleaning up...")
@@ -286,7 +237,6 @@ class TemperatureAndSpeechMonitor:
 
         self.mqtt_client.loop_stop()
         self.mqtt_client.disconnect()
-        self.influx_client.close()
 
     def audio_callback_pyaudio(self, in_data, frame_count, time_info, status):
         """Базовый callback для аудио"""
@@ -298,71 +248,100 @@ class TemperatureAndSpeechMonitor:
             logging.error(f"Error in audio callback: {e}")
             return (None, pyaudio.paAbort)
 
+    def reduce_noise(self, audio_data):
+        """Simple noise reduction"""
+        try:
+            # Calculate noise floor
+            noise_floor = np.percentile(np.abs(audio_data), 10)
+            # Apply soft threshold
+            audio_data = np.where(np.abs(audio_data) < noise_floor * 1.5, 0, audio_data)
+            return audio_data
+        except Exception as e:
+            logging.error(f"Error in noise reduction: {e}")
+            return audio_data  # Return original data if error occurs
+
     def process_audio(self):
         """Real-time audio processing with speech recognition"""
         logging.info("Starting real-time audio processing...")
 
-        # Initialize audio buffer
         audio_buffer = []
-        silence_threshold = 0.03  # Increased from 0.01 to handle noise
-        min_silence_duration = 1.0  # Increased from 0.5 to better detect speech gaps
+        silence_threshold = 0.005  # Уменьшаем с 0.015 до 0.005
+        min_silence_duration = 0.3  # Уменьшаем с 0.5 до 0.3
         silence_counter = 0
+        last_process_time = time.time()
+        process_interval = 1.0  # Уменьшаем с 2.0 до 1.0 секунды
 
-        def reduce_noise(audio_data):
-            """Simple noise reduction"""
-            # Calculate noise floor
-            noise_floor = np.percentile(np.abs(audio_data), 20)
-            # Apply soft threshold
-            audio_data = np.where(np.abs(audio_data) < noise_floor * 2, 0, audio_data)
-            return audio_data
+        def clean_temp_files():
+            try:
+                for file in os.listdir(self.temp_dir):
+                    if file.startswith("temp_speech"):
+                        os.remove(os.path.join(self.temp_dir, file))
+            except Exception as e:
+                logging.error(f"Error cleaning temp files: {e}")
 
         while True:
             try:
-                if not self.audio_queue.empty():
-                    # Get data from queue
-                    data = self.audio_queue.get()
+                current_time = time.time()
 
-                    data = reduce_noise(data)
-                    audio_buffer.extend(data)
+                # Проверяем состояние аудио потока каждые 30 секунд
+                if current_time - last_process_time > 30:
+                    logging.info("Audio processing is still running")
+                    last_process_time = current_time
 
-                    # Check audio level
-                    current_level = np.abs(data).mean()
+                # Получаем данные из очереди с таймаутом
+                try:
+                    data = self.audio_queue.get(timeout=1.0)
+                except Queue.Empty:
+                    continue
 
-                    if current_level > silence_threshold:
-                        silence_counter = 0
-                        # If enough data, start processing
-                        if len(audio_buffer) >= self.sample_rate * 2:  # 2 seconds of audio
-                            # Normalize audio
-                            audio_data = np.array(audio_buffer)
-                            audio_data = audio_data / np.max(np.abs(audio_data))
+                # Очищаем старые временные файлы
+                if current_time - last_process_time > 10:
+                    clean_temp_files()
 
-                            # Save to temp file
-                            temp_filename = os.path.join(self.temp_dir, "temp_speech.wav")
-                            with wave.open(temp_filename, 'wb') as wf:
-                                wf.setnchannels(1)
-                                wf.setsampwidth(2)
-                                wf.setframerate(self.sample_rate)
-                                wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+                data = self.reduce_noise(data)
+                audio_buffer.extend(data)
 
-                            # Recognize speech
+                current_level = np.abs(data).mean()
+                logging.debug(f"Current audio level: {current_level}")  # Добавляем отладочный вывод
+
+                if current_level > silence_threshold:
+                    silence_counter = 0
+                    if len(audio_buffer) >= self.sample_rate * 2:  # 2 seconds of audio
+                        if current_time - last_process_time >= process_interval:
                             try:
+                                # Нормализация аудио
+                                audio_data = np.array(audio_buffer)
+                                audio_data = audio_data / np.max(np.abs(audio_data))
+
+                                # Генерируем уникальное имя файла
+                                temp_filename = os.path.join(
+                                    self.temp_dir,
+                                    f"temp_speech_{int(time.time())}.wav"
+                                )
+
+                                with wave.open(temp_filename, 'wb') as wf:
+                                    wf.setnchannels(1)
+                                    wf.setsampwidth(2)
+                                    wf.setframerate(self.sample_rate)
+                                    wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+
+                                # Распознавание речи
                                 result = self.model.transcribe(
                                     temp_filename,
                                     language='pl',
                                     fp16=False,
-                                    verbose=False,
-                                    # Additional Whisper parameters for noisy environment
-                                    temperature=0.2,  # Lower temperature for more focused predictions
-                                    compression_ratio_threshold=2.4,  # Adjust for better noise handling
-                                    no_speech_threshold=0.6,  # Higher threshold to avoid false positives
-                                    condition_on_previous_text=True  # Help maintain context
+                                    verbose=True,  # Включаем подробный вывод
+                                    temperature=0.3,
+                                    compression_ratio_threshold=2.0,
+                                    no_speech_threshold=0.4,
+                                    condition_on_previous_text=True
                                 )
 
                                 text = result["text"].strip()
                                 if text:
-                                    logging.info(f"Recognized: {text}")
+                                    logging.info(f"Recognized text: {text}")
 
-                                    # Split and send each word
+                                    # Отправка слов
                                     words = text.split()
                                     for word in words:
                                         message = {
@@ -375,9 +354,8 @@ class TemperatureAndSpeechMonitor:
                                             json.dumps(message),
                                             qos=0
                                         )
-                                        logging.info(f"Published word: {word}")
 
-                                    # Send full text
+                                    # Отправка полного текста
                                     full_message = {
                                         "timestamp": datetime.now().isoformat(),
                                         "text": text,
@@ -388,27 +366,33 @@ class TemperatureAndSpeechMonitor:
                                         json.dumps(full_message),
                                         qos=0
                                     )
-                                    logging.info(f"Published full text: {text}")
 
-                                    # Clear buffer after successful recognition
-                                    audio_buffer = []
+                                # Очищаем буфер только после успешной обработки
+                                audio_buffer = []
+                                last_process_time = current_time
+
                             except Exception as e:
-                                logging.error(f"Recognition error: {e}")
-                    else:
-                        silence_counter += len(data) / self.sample_rate
-                        if silence_counter >= min_silence_duration:
-                            # Clear buffer after silence
-                            audio_buffer = []
-                            silence_counter = 0
+                                logging.error(f"Error processing audio: {e}", exc_info=True)
+                                # Сохраняем проблемный аудио файл для анализа
+                                error_file = f"error_audio_{int(time.time())}.wav"
+                                with wave.open(error_file, 'wb') as wf:
+                                    wf.setnchannels(1)
+                                    wf.setsampwidth(2)
+                                    wf.setframerate(self.sample_rate)
+                                    wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+                else:
+                    silence_counter += len(data) / self.sample_rate
+                    if silence_counter >= min_silence_duration:
+                        audio_buffer = []
+                        silence_counter = 0
 
-                # Prevent buffer overflow
-                if len(audio_buffer) > self.sample_rate * 10:  # max 10 seconds
-                    audio_buffer = audio_buffer[-self.sample_rate * 5:]  # keep last 5 seconds
-
-                time.sleep(0.01)  # Small delay to reduce CPU load
+                # Предотвращаем переполнение буфера
+                if len(audio_buffer) > self.sample_rate * 10:
+                    audio_buffer = audio_buffer[-self.sample_rate * 5:]
+                    logging.warning("Audio buffer truncated to prevent overflow")
 
             except Exception as e:
-                logging.error(f"Error in audio processing: {e}", exc_info=True)
+                logging.error(f"Error in audio processing loop: {e}", exc_info=True)
                 time.sleep(0.1)
 
     def initialize_audio(self):
@@ -432,8 +416,6 @@ class TemperatureAndSpeechMonitor:
         except Exception as e:
             logging.error(f"Error initializing audio: {e}")
             return None
-
-    import wave
 
     def test_microphone(self, duration=5, filename=None):
         """Тестирование микрофона с записью в файл"""
@@ -500,38 +482,37 @@ class TemperatureAndSpeechMonitor:
             return False, None
 
     def select_best_microphone(self):
-        """Выбор наилучшего микрофона"""
+        """Выбор микрофона номер 2"""
         try:
             p = pyaudio.PyAudio()
-            best_device = None
-            best_channels = 0
-            best_rate = 0
+            target_index = 2  # Фиксированный индекс микрофона
 
-            # Перебираем все устройства
+            # Выводим список всех устройств для информации
+            print("\nAvailable microphones:")
             for i in range(p.get_device_count()):
                 dev_info = p.get_device_info_by_index(i)
-                if dev_info.get('maxInputChannels') > 0:  # Только устройства с входом
-                    channels = dev_info.get('maxInputChannels')
-                    rate = int(dev_info.get('defaultSampleRate'))
+                if dev_info.get('maxInputChannels') > 0:
+                    print(f"{i}: {dev_info['name']}")
 
-                    # Предпочитаем устройства с более высоким качеством
-                    if best_device is None or (channels >= best_channels and rate >= best_rate):
-                        best_device = dev_info
-                        best_channels = channels
-                        best_rate = rate
-
-            if best_device:
-                logging.info(f"Selected best microphone: {best_device['name']}")
-                logging.info(f"Channels: {best_channels}")
-                logging.info(f"Sample rate: {best_rate}")
-                return int(best_device['index'])
-            else:
-                logging.error("No suitable microphone found")
+            # Проверяем существование устройства с индексом 2
+            try:
+                device_info = p.get_device_info_by_index(target_index)
+                if device_info.get('maxInputChannels') > 0:
+                    logging.info(f"\nUsing fixed device {target_index}: {device_info['name']}")
+                    return target_index
+                else:
+                    logging.error(f"Device {target_index} does not have input channels")
+                    return None
+            except Exception as e:
+                logging.error(f"Error accessing device {target_index}: {e}")
                 return None
 
         except Exception as e:
-            logging.error(f"Error selecting microphone: {e}")
+            logging.error(f"Error in microphone selection: {e}")
             return None
+        finally:
+            if 'p' in locals():
+                p.terminate()
 
     def run(self):
         """Запуск монитора"""
@@ -540,7 +521,7 @@ class TemperatureAndSpeechMonitor:
 
             # Инициализация детектора объектов и камеры
             self.object_detector = ObjectDetector(self.mqtt_client)
-            camera_url = f"http://192.168.254.223:4747/video"  # URL для DroidCam
+            camera_url = f"http://192.168.127.248:4747/video"  # URL для DroidCam
             self.camera = cv2.VideoCapture(camera_url)
 
             if not self.camera.isOpened():
@@ -564,8 +545,8 @@ class TemperatureAndSpeechMonitor:
             # Initialize PyAudio with the tested device
             p = pyaudio.PyAudio()
             device_index = self.select_best_microphone()
-            if device_index is None:
-                raise Exception("No suitable microphone found")
+            if device_index != 2:  # Проверяем, что используется нужный микрофон
+                raise Exception("Failed to select microphone #2")
 
             device_info = p.get_device_info_by_index(device_index)
             logging.info(f"Using audio device: {device_info['name']}")
@@ -595,15 +576,41 @@ class TemperatureAndSpeechMonitor:
 
             # Start video processing thread
             def video_processing_loop():
+                last_image_time = time.time()
+                image_interval = 3.0  # Интервал отправки изображений в секундах
+
                 while True:
                     try:
                         ret, frame = self.camera.read()
+                        current_time = time.time()
+
                         if ret:
                             processed_frame, fps, detected_objects = self.object_detector.process_frame(frame)
+
+                            # Отправляем данные только каждые 3 секунды
+                            if current_time - last_image_time >= image_interval:
+                                if detected_objects:
+                                    message = {
+                                        "timestamp": datetime.now().isoformat(),
+                                        "objects": detected_objects,
+                                        "fps": fps
+                                    }
+                                    self.mqtt_client.publish(
+                                        OBJECT_DETECTION_TOPIC,
+                                        json.dumps(message),
+                                        qos=0
+                                    )
+                                    last_image_time = current_time
+                                    logging.info("Image data sent to broker")  # Добавляем лог для отслеживания отправки
+
                             cv2.imshow("Object Detection", processed_frame)
 
                             if cv2.waitKey(1) & 0xFF == ord('q'):
                                 break
+
+                        # Небольшая задержка для снижения нагрузки на CPU
+                        time.sleep(0.01)
+
                     except Exception as e:
                         logging.error(f"Error in video processing: {e}")
                         time.sleep(1)
@@ -616,7 +623,6 @@ class TemperatureAndSpeechMonitor:
             # Main loop
             while True:
                 time.sleep(10)
-                self.print_stats()
                 logging.info("System is running...")
 
         except KeyboardInterrupt:
@@ -648,30 +654,27 @@ def get_audio_device():
 
 
 def main():
-    monitor = TemperatureAndSpeechMonitor()
+    processor = AudioVideoProcessor()
     try:
-        monitor.connect()
-        monitor.run()
+        # Удалить processor.connect()
+        processor.run()
     except Exception as e:
         logging.error(f"Error in main: {e}")
         raise
     finally:
-        monitor.cleanup()
+        processor.cleanup()
 
 
 if __name__ == "__main__":
-    monitor = TemperatureAndSpeechMonitor()
+    processor = AudioVideoProcessor()
     try:
-        # Тестируем микрофон отдельно
-        success, test_file = monitor.test_microphone(duration=5)
+        success, test_file = processor.test_microphone(duration=5)
         if success:
             logging.info(f"Test recording saved to: {test_file}")
             input("Press Enter after checking the recording...")
 
-        # Запускаем основной код
-        monitor.connect()
-        monitor.run()
+        processor.run()  # MQTT подключение уже выполнено в __init__
     except Exception as e:
         logging.error(f"Error in main: {e}")
     finally:
-        monitor.cleanup()
+        processor.cleanup()

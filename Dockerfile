@@ -1,21 +1,16 @@
-FROM python:3.9
+FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    portaudio19-dev \
-    python3-pyaudio \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements
+# Copy requirements and SSL certificate
 COPY requirements.txt .
+COPY emqxsl-ca.crt .
 
 # Install Python dependencies
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
-COPY . .
+COPY subscriber.py .
 
-# Run the application
-CMD ["python", "main.py"]
+# Run the subscriber
+CMD ["python", "subscriber.py"]
