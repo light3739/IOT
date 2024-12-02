@@ -22,11 +22,11 @@ project/
 ├── video-to-text/      # Object detection module
 ├── docker-compose.yml  # Docker configuration for InfluxDB and Grafana
 ├── README.md           # Project documentation
-└── diagrams/           # Block diagrams and project schematics
+
 `````
 ## Autorzy
 
-- *Twoje imię* — deweloper projektu.
+- Maksim Piatlitski i Maksym Veduta — deweloper projektu.
 
 ## Wymagania środowiskowe
 
