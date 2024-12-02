@@ -24,7 +24,7 @@ SPEECH_TOPIC = "speech_text"
 MICROPHONE_INDEX = 2
 # В начале файла
 SAMPLE_RATE = 16000  # Меняем на стандартную частоту для Whisper
-CHUNK_SIZE = 512  # Уменьшаем размер чанка
+CHUNK_SIZE = 1024  # Уменьшаем размер чанка
 MIN_AUDIO_LENGTH = 1.5  # Увеличиваем минимальную длину
 MAX_AUDIO_LENGTH = 30.0  # Увеличиваем максимальную длину
 PLAYBACK_VOLUME = 0.5  # Увеличиваем громкость
@@ -65,6 +65,42 @@ class SimpleAudioProcessor:
         self.temp_dir = "temp_audio"
         if not os.path.exists(self.temp_dir):
             os.makedirs(self.temp_dir)
+
+    def preprocess_audio(self, audio_data):
+        """Предварительная обработка аудио для улучшения качества распознавания."""
+        try:
+            # Нормализация
+            audio_data = audio_data / np.max(np.abs(audio_data)) if np.max(np.abs(audio_data)) > 0 else audio_data
+
+            # Удаление постоянной составляющей
+            audio_data = audio_data - np.mean(audio_data)
+
+            # Применение простого шумоподавления
+            noise_threshold = 0.005
+            audio_data[np.abs(audio_data) < noise_threshold] = 0
+
+            return audio_data
+        except Exception as e:
+            logging.error(f"Error in audio preprocessing: {e}")
+            return audio_data
+
+    def detect_voice_activity(self, audio_data, frame_length=1024, threshold=0.01):
+        """Определение наличия голоса в аудио."""
+        try:
+            # Разбиваем на фреймы
+            frames = np.array_split(audio_data, len(audio_data) // frame_length)
+
+            # Вычисляем энергию для каждого фрейма
+            energies = [np.sum(np.abs(frame)) / len(frame) for frame in frames]
+
+            # Определяем наличие голоса
+            voice_frames = sum(1 for energy in energies if energy > threshold)
+            voice_ratio = voice_frames / len(frames)
+
+            return voice_ratio > 0.1  # Возвращаем True если более 10% фреймов содержат голос
+        except Exception as e:
+            logging.error(f"Error in voice detection: {e}")
+            return True
 
     def setup_streams(self):
         try:
@@ -142,8 +178,13 @@ class SimpleAudioProcessor:
 
     async def process_speech(self, audio_data):
         try:
-            # Нормализуем аудио перед сохранением
-            audio_data = audio_data / np.max(np.abs(audio_data)) if np.max(np.abs(audio_data)) > 0 else audio_data
+            # Предварительная обработка
+            processed_audio = self.preprocess_audio(audio_data)
+
+            # Проверка наличия голоса
+            if not self.detect_voice_activity(processed_audio):
+                logging.info("No voice activity detected, skipping processing")
+                return
 
             temp_filename = os.path.join(
                 self.temp_dir,
@@ -154,108 +195,138 @@ class SimpleAudioProcessor:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(SAMPLE_RATE)
-                wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+                wf.writeframes((processed_audio * 32767).astype(np.int16).tobytes())
 
-            logging.info("Starting speech recognition...")
+            # Оптимизированные параметры для Whisper
             result = await asyncio.to_thread(
                 self.model.transcribe,
                 temp_filename,
                 language='pl',
-                fp16=False,
-                temperature=0.0,
-                no_speech_threshold=0.3,
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=2.4
+                fp16=True,  # Включаем FP16 для ускорения
+                temperature=0.0,  # Уменьшаем вариативность
+                no_speech_threshold=0.5,
+                compression_ratio_threshold=2.0,
+                condition_on_previous_text=False  # Отключаем для ускорения
             )
 
             os.remove(temp_filename)
 
             text = result["text"].strip()
             if text:
-                # Отправляем только полный текст
+                # Базовая постобработка текста
+                text = self.postprocess_text(text)
+
                 message = {
                     "timestamp": datetime.now().isoformat(),
                     "text": text,
-                    "audio_level": float(np.abs(audio_data).mean())
+                    "audio_level": float(np.abs(processed_audio).mean()),
+                    "confidence": float(result.get("confidence", 0.0))
                 }
 
-                # Проверяем подключение к MQTT
-                retry_count = 0
-                max_retries = 3
-                while not self.mqtt_client.is_connected() and retry_count < max_retries:
-                    try:
-                        logging.warning("MQTT disconnected, attempting to reconnect...")
-                        self.mqtt_client.reconnect()
-                        await asyncio.sleep(1)
-                        retry_count += 1
-                    except Exception as e:
-                        logging.error(f"Reconnection attempt {retry_count} failed: {e}")
-
-                if self.mqtt_client.is_connected():
-                    # Отправляем в топик speech_text/full
-                    full_result = self.mqtt_client.publish(
-                        f"{SPEECH_TOPIC}/full",
-                        json.dumps(message),
-                        qos=1
-                    )
-
-                    if full_result.rc == mqtt.MQTT_ERR_SUCCESS:
-                        logging.info(f"Successfully sent to MQTT - Text: {text}")
-                    else:
-                        logging.error(f"Failed to send to MQTT - Error code: {full_result.rc}")
-                else:
-                    logging.error("Failed to reconnect to MQTT broker")
+                await self.send_mqtt_message(message)
             else:
                 logging.info("No speech detected in audio")
 
         except Exception as e:
             logging.error(f"Error processing speech: {e}", exc_info=True)
-            # Сохраняем проблемное аудио для анализа
-            try:
-                error_file = os.path.join(
-                    self.temp_dir,
-                    f"error_audio_{int(time.time() * 1000)}.wav"
+
+    async def send_mqtt_message(self, message):
+        """Асинхронная отправка MQTT сообщения с повторными попытками."""
+        try:
+            retry_count = 0
+            max_retries = 3
+
+            while not self.mqtt_client.is_connected() and retry_count < max_retries:
+                try:
+                    logging.warning("MQTT disconnected, attempting to reconnect...")
+                    self.mqtt_client.reconnect()
+                    await asyncio.sleep(1)
+                    retry_count += 1
+                except Exception as e:
+                    logging.error(f"Reconnection attempt {retry_count} failed: {e}")
+
+            if self.mqtt_client.is_connected():
+                # Отправляем в топик speech_text/full
+                result = self.mqtt_client.publish(
+                    f"{SPEECH_TOPIC}/full",
+                    json.dumps(message),
+                    qos=1
                 )
-                with wave.open(error_file, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
-                logging.info(f"Saved error audio to: {error_file}")
-            except Exception as save_error:
-                logging.error(f"Failed to save error audio: {save_error}")
+
+                # Проверяем результат отправки
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    logging.info(f"Successfully sent to MQTT - Text: {message.get('text', '')}")
+                    return True
+                else:
+                    logging.error(f"Failed to send to MQTT - Error code: {result.rc}")
+                    return False
+            else:
+                logging.error("Failed to reconnect to MQTT broker")
+                return False
+
+        except Exception as e:
+            logging.error(f"Error sending MQTT message: {e}")
+            return False
+
+    def postprocess_text(self, text):
+        """Постобработка распознанного текста."""
+        try:
+            # Удаление лишних пробелов
+            text = ' '.join(text.split())
+
+            # Базовые правила корректировки
+            text = text.replace(" ,", ",")
+            text = text.replace(" .", ".")
+            text = text.replace(" ?", "?")
+            text = text.replace(" !", "!")
+
+            # Приведение к правильному регистру
+            if text and text[0].islower():
+                text = text[0].upper() + text[1:]
+
+            return text
+        except Exception as e:
+            logging.error(f"Error in text postprocessing: {e}")
+            return text
 
     async def process_audio(self):
         while True:
             try:
-                # Собираем аудио в течение 10 секунд
+                # Собираем аудио в течение 5 секунд
                 start_time = time.time()
                 self.audio_buffer = []
 
-                logging.info("Starting 10-second audio collection...")
+                logging.info("Starting 5-second audio collection...")
 
-                while time.time() - start_time < 10.0:  # 10 секунд записи
+                # Используем меньший интервал записи
+                while time.time() - start_time < 5.0:  # 5 секунд записи
                     try:
-                        data = await asyncio.wait_for(self.audio_queue.get(), timeout=0.1)
+                        # Уменьшаем timeout для более быстрой обработки
+                        data = await asyncio.wait_for(self.audio_queue.get(), timeout=0.05)
                         self.play_audio(data)
                         self.audio_buffer.extend(data.flatten())
                     except asyncio.TimeoutError:
                         continue
 
                 # Проверяем, есть ли данные для обработки
-                if len(self.audio_buffer) > SAMPLE_RATE:  # минимум 1 секунда аудио
+                if len(self.audio_buffer) > SAMPLE_RATE * 0.5:  # минимум 0.5 секунды аудио
                     audio_data = np.array(self.audio_buffer)
 
-                    # Проверяем уровень звука
+                    # Оптимизация: предварительная фильтрация шума
                     audio_level = np.abs(audio_data).mean()
                     logging.info(f"Current audio level: {audio_level}")
 
-                    # Уменьшаем порог до 0.001 (было 0.01)
                     if audio_level > 0.001:
-                        logging.info("Processing 10-second audio chunk...")
-                        await self.process_speech(audio_data)
+                        # Создаем задачу для обработки речи
+                        processing_task = asyncio.create_task(self.process_speech(audio_data))
+
+                        # Ждем завершения обработки не более 10 секунд
+                        try:
+                            await asyncio.wait_for(processing_task, timeout=10.0)
+                        except asyncio.TimeoutError:
+                            logging.warning("Speech processing timed out")
                     else:
-                        logging.info(f"Audio level too low ({audio_level}), skipping...")
+                        logging.debug(f"Audio level too low ({audio_level}), skipping...")
 
                 # Очищаем буфер
                 self.audio_buffer = []
